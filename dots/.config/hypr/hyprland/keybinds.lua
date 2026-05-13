@@ -1,8 +1,10 @@
 require("hyprland.variables")
 require("custom.variables")
 
-local qsScripts = "$HOME/.config/quickshell/$qsConfig/scripts"
-local hyprScripts = "$HOME/.config/hypr/hyprland/scripts"
+local home_dir = os.getenv("HOME")
+
+local qsScripts = home_dir.."/.config/quickshell/$qsConfig/scripts"
+local hyprScripts = home_dir.."/.config/hypr/hyprland/scripts"
 local qsIpcCall = "qs -c $qsConfig ipc call"
 local qsIsAlive = qsIpcCall.." TEST_ALIVE"
 
