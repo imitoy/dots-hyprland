@@ -49,8 +49,7 @@ Singleton {
     )
     
     readonly property var preppedNames: list.map(a => ({
-        name: Fuzzy.prepare(`${a.name} `),
-        id: Fuzzy.prepare(`${a.id} `),
+        name: Fuzzy.prepare(`${a.name} ${a.id} ${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")} `),
         entry: a
     }))
 
@@ -65,7 +64,10 @@ Singleton {
                 entry: obj,
                 score: Math.max(
                     Levendist.computeScore(obj.name.toLowerCase(), search.toLowerCase()),
-                    Levendist.computeScore(obj.id.toLowerCase(), search.toLowerCase())
+                    Levendist.computeScore(obj.id.toLowerCase(), search.toLowerCase()),
+                    Levendist.computeScore((obj.genericName ?? "").toLowerCase(), search.toLowerCase()),
+                    Levendist.computeScore((obj.comment ?? "").toLowerCase(), search.toLowerCase()),
+                    ...(obj.keywords ?? []).map(k => Levendist.computeScore(k.toLowerCase(), search.toLowerCase()))
                 )
             })).filter(item => item.score > root.scoreThreshold)
                 .sort((a, b) => b.score - a.score)
@@ -75,7 +77,7 @@ Singleton {
 
         return Fuzzy.go(search, preppedNames, {
             all: true,
-            keys: ["name", "id"]
+            key: "name"
         }).map(r => {
             return r.obj.entry
         });
