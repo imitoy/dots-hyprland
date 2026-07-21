@@ -31,3 +31,5 @@ if status is-interactive
         alias ssh 'kitten ssh'
     end
 end
+
+source /opt/miniconda3/etc/fish/conf.d/conda.fish
