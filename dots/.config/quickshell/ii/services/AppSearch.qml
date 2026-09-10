@@ -3,6 +3,7 @@ pragma Singleton
 import qs.modules.common
 import qs.modules.common.functions
 import Quickshell
+import QtQuick 2.15
 
 /**
  * - Eases fuzzy searching for applications by name
@@ -14,6 +15,7 @@ Singleton {
     property real scoreThreshold: 0.2
     // 搜索结果上限:防止短查询匹配到几百条时 LauncherSearch 为每条 createObject 导致卡顿
     property int maxResults: 30
+    property var _iconCache: ({})
     property var substitutions: ({
         "code-url-handler": "visual-studio-code",
         "Code": "visual-studio-code",
@@ -43,7 +45,7 @@ Singleton {
     ]
 
     // Deduped list to fix double icons
-    readonly property list<DesktopEntry> list: Array.from(DesktopEntries.applications.values)
+    /*readonly property list<DesktopEntry> list: Array.from(DesktopEntries.applications.values)
         .filter((app, index, self) => 
             index === self.findIndex((t) => (
                 t.id === app.id
@@ -64,7 +66,64 @@ Singleton {
     readonly property var preppedIcons: list.map(a => ({
         name: Fuzzy.prepare(`${a.icon} `),
         entry: a
-    }))
+    }))*/
+
+    property var list: []
+    property var preppedNames: []
+    property var preppedIcons: []
+
+    Timer {
+        id: reindexTimer
+        interval: 300
+        repeat: false
+        onTriggered: root.rebuildIndex()
+    }
+
+    Connections {
+        target: DesktopEntries.applications
+        function onValuesChanged() {
+            // 只要系统桌面条目还在频繁变动，就一直重置定时器，直到平静后才开始计算
+            reindexTimer.restart()
+        }
+    }
+
+    Component.onCompleted: {
+        root.rebuildIndex()
+    }
+
+    // ==========================================
+    // 💡 2. O(N) 高效重建索引函数
+    // ==========================================
+    function rebuildIndex() {
+        const rawApps = DesktopEntries.applications.values;
+        if (!rawApps) return;
+
+        // 2.1 O(N) 高性能去重（使用 Set 替代原有的 filter + findIndex）
+        const seenIds = new Set();
+        const dedupedList = [];
+        for (let i = 0; i < rawApps.length; i++) {
+            const app = rawApps[i];
+            if (app && app.id && !seenIds.has(app.id)) {
+                seenIds.add(app.id);
+                dedupedList.push(app);
+            }
+        }
+        root.list = dedupedList;
+
+        // 2.2 预计算搜索索引
+        root.preppedNames = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.name} `),
+            id: Fuzzy.prepare(`${a.id} `),
+            extra: Fuzzy.prepare(`${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")} `),
+            merged: `${a.name} ${a.id} ${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")}`.toLowerCase(),
+            entry: a
+        }));
+
+        root.preppedIcons = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.icon} `),
+            entry: a
+        }));
+    }
 
     /**
      * 模糊搜索应用。参数 search: 用户输入的查询串;返回匹配的 DesktopEntry 数组。
@@ -107,7 +166,7 @@ Singleton {
     }
 
     function iconExists(iconName) {
-        if (!iconName || iconName.length == 0) return false;
+        if (!iconName || iconName.length === 0) return false;
         return (Quickshell.iconPath(iconName, true).length > 0) 
             && !iconName.includes("image-missing");
     }
@@ -125,69 +184,75 @@ Singleton {
     }
 
     function guessIcon(str) {
-        if (!str || str.length == 0) return "image-missing";
+        if (!str || str.length === 0) return "image-missing";
 
-        // Quickshell's desktop entry lookup
-        const entry = DesktopEntries.byId(str);
-        if (entry) return entry.icon;
-
-        // Normal substitutions
-        if (substitutions[str]) return substitutions[str];
-        if (substitutions[str.toLowerCase()]) return substitutions[str.toLowerCase()];
-
-        // Regex substitutions
-        for (let i = 0; i < regexSubstitutions.length; i++) {
-            const substitution = regexSubstitutions[i];
-            const replacedName = str.replace(
-                substitution.regex,
-                substitution.replace,
-            );
-            if (replacedName != str) return replacedName;
+        // 💡 1. 优先查缓存：如果之前推导过这个 Class 的图标，直接 O(1) 毫秒级返回
+        if (_iconCache[str] !== undefined) {
+            return _iconCache[str];
         }
 
-        // Icon exists -> return as is
-        if (iconExists(str)) return str;
+        // 内部计算真实图标的辅助闭包
+        let res = (function() {
+            // Quickshell's desktop entry lookup
+            const entry = DesktopEntries.byId(str);
+            if (entry) return entry.icon;
 
+            // Normal substitutions
+            if (substitutions[str]) return substitutions[str];
+            if (substitutions[str.toLowerCase()]) return substitutions[str.toLowerCase()];
 
-        // Simple guesses
-        const lowercased = str.toLowerCase();
-        if (iconExists(lowercased)) return lowercased;
+            // Regex substitutions
+            for (let i = 0; i < regexSubstitutions.length; i++) {
+                const substitution = regexSubstitutions[i];
+                const replacedName = str.replace(
+                    substitution.regex,
+                    substitution.replace,
+                );
+                if (replacedName !== str) return replacedName;
+            }
 
-        const reverseDomainNameAppName = getReverseDomainNameAppName(str);
-        if (iconExists(reverseDomainNameAppName)) return reverseDomainNameAppName;
+            // Icon exists -> return as is
+            if (iconExists(str)) return str;
 
-        const lowercasedDomainNameAppName = reverseDomainNameAppName.toLowerCase();
-        if (iconExists(lowercasedDomainNameAppName)) return lowercasedDomainNameAppName;
+            // Simple guesses
+            const lowercased = str.toLowerCase();
+            if (iconExists(lowercased)) return lowercased;
 
-        const kebabNormalizedGuess = getKebabNormalizedAppName(str);
-        if (iconExists(kebabNormalizedGuess)) return kebabNormalizedGuess;
+            const reverseDomainNameAppName = getReverseDomainNameAppName(str);
+            if (iconExists(reverseDomainNameAppName)) return reverseDomainNameAppName;
 
-        const undescoreToKebabGuess = getUndescoreToKebabAppName(str);
-        if (iconExists(undescoreToKebabGuess)) return undescoreToKebabGuess;
+            const lowercasedDomainNameAppName = reverseDomainNameAppName.toLowerCase();
+            if (iconExists(lowercasedDomainNameAppName)) return lowercasedDomainNameAppName;
 
-        // Search in desktop entries
-        const iconSearchResults = Fuzzy.go(str, preppedIcons, {
-            all: true,
-            key: "name"
-        }).map(r => {
-            return r.obj.entry
-        });
-        if (iconSearchResults.length > 0) {
-            const guess = iconSearchResults[0].icon
-            if (iconExists(guess)) return guess;
-        }
+            const kebabNormalizedGuess = getKebabNormalizedAppName(str);
+            if (iconExists(kebabNormalizedGuess)) return kebabNormalizedGuess;
 
-        const nameSearchResults = root.fuzzyQuery(str);
-        if (nameSearchResults.length > 0) {
-            const guess = nameSearchResults[0].icon
-            if (iconExists(guess)) return guess;
-        }
+            const undescoreToKebabGuess = getUndescoreToKebabAppName(str);
+            if (iconExists(undescoreToKebabGuess)) return undescoreToKebabGuess;
 
-        // Quickshell's desktop entry lookup
-        const heuristicEntry = DesktopEntries.heuristicLookup(str);
-        if (heuristicEntry) return heuristicEntry.icon;
+            // 💡 2. 优化：只用轻量级的 heuristicLookup，移除了耗时的 root.fuzzyQuery(str) 全量模糊匹配
+            const heuristicEntry = DesktopEntries.heuristicLookup(str);
+            if (heuristicEntry) return heuristicEntry.icon;
 
-        // Give up
-        return "application-x-executable";
+            // Search in desktop entries (仅当极少数情况下尝试轻量 icon 搜索)
+            const iconSearchResults = Fuzzy.go(str, preppedIcons, {
+                all: false, // 💡 改为 false，匹配到即停止，不强行遍历全量数组
+                limit: 1,
+                key: "name"
+            }).map(r => r.obj.entry);
+
+            if (iconSearchResults.length > 0) {
+                const guess = iconSearchResults[0].icon;
+                if (iconExists(guess)) return guess;
+            }
+
+            // Give up
+            return "application-x-executable";
+        })();
+
+        // 💡 3. 将计算出的结果写入缓存
+        _iconCache[str] = res;
+        return res;
     }
+
 }
