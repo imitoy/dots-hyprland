@@ -44,29 +44,35 @@ Singleton {
         }
     ]
 
-    // Deduped list to fix double icons
-    /*readonly property list<DesktopEntry> list: Array.from(DesktopEntries.applications.values)
-        .filter((app, index, self) => 
-            index === self.findIndex((t) => (
-                t.id === app.id
-            ))
-    )
-    
-    // 预计算搜索索引(仅应用列表变化时计算一次):
-    // - name/id/extra 分字段 prepare 供 fuzzysort keys 匹配(独立评分,不被长串稀释)
-    // - merged 合并小写串供 sloppySearch 使用(子串短路 + 单次 Levenshtein)
-    readonly property var preppedNames: list.map(a => ({
-        name: Fuzzy.prepare(`${a.name} `),
-        id: Fuzzy.prepare(`${a.id} `),
-        extra: Fuzzy.prepare(`${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")} `),
-        merged: `${a.name} ${a.id} ${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")}`.toLowerCase(),
-        entry: a
-    }))
+    // Cache
+    property var _iconCache: ({})
+    property var list: []
+    property var preppedNames: []
+    property var preppedIcons: []
 
-    readonly property var preppedIcons: list.map(a => ({
-        name: Fuzzy.prepare(`${a.icon} `),
-        entry: a
-    }))*/
+    // Debounce Application Re-indexing
+    Timer {
+        id: reindexTimer
+        interval: 300
+        repeat: false
+        onTriggered: root.rebuildIndex()
+    }
+
+    Connections {
+        target: DesktopEntries.applications
+
+        // Restart timer when desktop values changes
+        function onValuesChanged(){
+            reindexTimer.restart()
+        }
+    }
+
+    Component.onCompleted: {
+        root.rebuildIndex()
+    }
+
+    // Icon cache
+    property var _iconCache: ({})
 
     property var list: []
     property var preppedNames: []
@@ -186,7 +192,6 @@ Singleton {
     function guessIcon(str) {
         if (!str || str.length === 0) return "image-missing";
 
-        // 💡 1. 优先查缓存：如果之前推导过这个 Class 的图标，直接 O(1) 毫秒级返回
         if (_iconCache[str] !== undefined) {
             return _iconCache[str];
         }
@@ -253,6 +258,36 @@ Singleton {
         // 💡 3. 将计算出的结果写入缓存
         _iconCache[str] = res;
         return res;
+    }
+
+    function rebuildIndex() {
+        const rawApps = DesktopEntries.applications.values;
+        if (!rawApps) return;
+
+        // Optimize Deduplication Complexity
+        const seenIds = new Set();
+        const dedupedList = [];
+        for (let i = 0; i < rawApps.length; i++) {
+            const app = rawApps[i];
+            if (app && app.id && !seenIds.has(app.id)) {
+                seenIds.add(app.id);
+                dedupedList.push(app);
+            }
+        }
+        root.list = dedupedList;
+
+        root.preppedNames = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.name} `),
+            id: Fuzzy.prepare(`${a.id} `),
+            extra: Fuzzy.prepare(`${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")} `),
+            merged: `${a.name} ${a.id} ${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")}`.toLowerCase(),
+            entry: a
+        }));
+
+        root.preppedIcons = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.icon} `),
+            entry: a
+        }));
     }
 
 }
