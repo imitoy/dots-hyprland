@@ -56,23 +56,7 @@ Singleton {
 
     // Load user action scripts from ~/.config/illogical-impulse/actions/
     // Uses FolderListModel to auto-reload when scripts are added/removed
-    property var userActionScripts: []/*{
-        const actions = [];
-        for (let i = 0; i < userActionsFolder.count; i++) {
-            const fileName = userActionsFolder.get(i, "fileName");
-            const filePath = userActionsFolder.get(i, "filePath");
-            if (fileName && filePath) {
-                const actionName = fileName.replace(/\.[^/.]+$/, ""); // strip extension
-                actions.push({
-                    action: actionName,
-                    execute: ((path) => (args) => {
-                        Quickshell.execDetached([path, ...(args ? args.split(" ") : [])]);
-                    })(FileUtils.trimFileProtocol(filePath.toString()))
-                });
-            }
-        }
-        return actions;
-    }*/
+    property var userActionScripts: []
 
     function updateUserActionScripts() {
         const actions = [];
@@ -230,6 +214,7 @@ Singleton {
     function rebuildResults() {
         clearOldObjects();
 
+        ///////////// Special cases ///////////////
         if (root.query === "") {
             root.results = [];
             return;
@@ -242,8 +227,8 @@ Singleton {
             return obj;
         }
 
-        // Clipboard
         if (root.query.startsWith(Config.options.search.prefix.clipboard)) {
+            // Clipboard
             const searchString = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.clipboard);
             const rawClipResults = Cliphist.fuzzyQuery(searchString);
             
@@ -259,21 +244,24 @@ Singleton {
                     name: StringUtils.cleanCliphistEntry(entry),
                     verb: "",
                     type: type,
-                    execute: () => { Cliphist.copy(entry); },
-                    actions: [
-                        createResultObj({
+                    execute: () => {
+                        Cliphist.copy(entry);
+                    },
+                    actions: [createResultObj({
                             name: Translation.tr("Copy"),
                             iconName: "content_copy",
                             iconType: LauncherSearchResult.IconType.Material,
-                            execute: () => { Cliphist.copy(entry); }
-                        }),
-                        createResultObj({
+                            execute: () => {
+                                Cliphist.copy(entry);
+                            }
+                        }), createResultObj({
                             name: Translation.tr("Delete"),
                             iconName: "delete",
                             iconType: LauncherSearchResult.IconType.Material,
-                            execute: () => { Cliphist.deleteEntry(entry); }
-                        })
-                    ],
+                            execute: () => {
+                                Cliphist.deleteEntry(entry);
+                            }
+                        })],
                     blurImage: shouldBlurImage
                 });
             }).filter(Boolean);
@@ -281,10 +269,7 @@ Singleton {
             root._activeObjects = createdObjects;
             root.results = clipObjects;
             return;
-        }
-
-        // Emoji
-        if (root.query.startsWith(Config.options.search.prefix.emojis)) {
+        }else if (root.query.startsWith(Config.options.search.prefix.emojis)) {
             const searchString = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.emojis);
             const rawEmojiResults = Emojis.fuzzyQuery(searchString);
             
@@ -308,6 +293,7 @@ Singleton {
             return;
         }
 
+        ////////////////// Init ///////////////////
         const mathResultObject = createResultObj({
             name: root.mathResult,
             verb: Translation.tr("Copy"),
@@ -315,7 +301,9 @@ Singleton {
             fontType: LauncherSearchResult.FontType.Monospace,
             iconName: 'calculate',
             iconType: LauncherSearchResult.IconType.Material,
-            execute: () => { Quickshell.clipboardText = root.mathResult; }
+            execute: () => {
+                Quickshell.clipboardText = root.mathResult;
+            }
         });
 
         const rawAppEntries = AppSearch.fuzzyQuery(StringUtils.cleanPrefix(root.query, Config.options.search.prefix.app));
@@ -329,8 +317,12 @@ Singleton {
                 iconType: LauncherSearchResult.IconType.System,
                 verb: Translation.tr("Open"),
                 execute: () => {
-                    if (!entry.runInTerminal) entry.execute();
-                    else Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(entry.command.join(' '))}'`]);
+                    if (!entry.runInTerminal)
+                        entry.execute();
+                    else {
+                        // Probably needs more proper escaping, but this will do for now
+                        Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(entry.command.join(' '))}'`]);
+                    }
                 },
                 comment: entry.comment,
                 runInTerminal: entry.runInTerminal,
@@ -342,8 +334,11 @@ Singleton {
                         iconName: action.icon,
                         iconType: LauncherSearchResult.IconType.System,
                         execute: () => {
-                            if (!action.runInTerminal) action.execute();
-                            else Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(action.command.join(' '))}'`]);
+                            if (!action.runInTerminal)
+                                action.execute();
+                            else {
+                                Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(action.command.join(' '))}'`]);
+                            }
                         }
                     });
                 })
@@ -400,6 +395,7 @@ Singleton {
             return null;
         }).filter(Boolean);
 
+        //////// Prioritized by prefix /////////
         let finalResults = [];
         const startsWithNumber = /^\d/.test(root.query);
         const startsWithMathPrefix = root.query.startsWith(Config.options.search.prefix.math);
@@ -414,13 +410,20 @@ Singleton {
             finalResults.push(webSearchResultObject);
         }
 
+        //////////////// Apps //////////////////
         finalResults = finalResults.concat(appResultObjects);
+
+        ////////// Launcher actions ////////////
         finalResults = finalResults.concat(launcherActionObjects);
 
+        /// Math result, command, web search ///
         if (Config.options.search.prefix.showDefaultActionsWithoutPrefix) {
-            if (!startsWithShellCommandPrefix) finalResults.push(commandResultObject);
-            if (!startsWithNumber && !startsWithMathPrefix) finalResults.push(mathResultObject);
-            if (!startsWithWebSearchPrefix) finalResults.push(webSearchResultObject);
+            if (!startsWithShellCommandPrefix)
+                finalResults.push(commandResultObject);
+            if (!startsWithNumber && !startsWithMathPrefix)
+                finalResults.push(mathResultObject);
+            if (!startsWithWebSearchPrefix)
+                finalResults.push(webSearchResultObject);
         }
 
         root._activeObjects = createdObjects;
