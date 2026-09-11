@@ -3,6 +3,7 @@ pragma Singleton
 import qs.modules.common
 import qs.modules.common.functions
 import Quickshell
+import QtQuick 2.15
 
 /**
  * - Eases fuzzy searching for applications by name
@@ -40,23 +41,32 @@ Singleton {
         }
     ]
 
-    // Deduped list to fix double icons
-    readonly property list<DesktopEntry> list: Array.from(DesktopEntries.applications.values)
-        .filter((app, index, self) => 
-            index === self.findIndex((t) => (
-                t.id === app.id
-            ))
-    )
-    
-    readonly property var preppedNames: list.map(a => ({
-        name: Fuzzy.prepare(`${a.name} `),
-        entry: a
-    }))
+    // Cache
+    property var _iconCache: ({})
+    property var list: []
+    property var preppedNames: []
+    property var preppedIcons: []
 
-    readonly property var preppedIcons: list.map(a => ({
-        name: Fuzzy.prepare(`${a.icon} `),
-        entry: a
-    }))
+    // Debounce Application Re-indexing
+    Timer {
+        id: reindexTimer
+        interval: 300
+        repeat: false
+        onTriggered: root.rebuildIndex()
+    }
+
+    Connections {
+        target: DesktopEntries.applications
+
+        // Restart timer when desktop values changes
+        function onValuesChanged(){
+            reindexTimer.restart()
+        }
+    }
+
+    Component.onCompleted: {
+        root.rebuildIndex()
+    }
 
     // Icon cache
     property var _iconCache: ({})
@@ -175,4 +185,35 @@ Singleton {
         _iconCache[str] = res;
         return res;
     }
+
+    function rebuildIndex() {
+        const rawApps = DesktopEntries.applications.values;
+        if (!rawApps) return;
+
+        // Optimize Deduplication Complexity
+        const seenIds = new Set();
+        const dedupedList = [];
+        for (let i = 0; i < rawApps.length; i++) {
+            const app = rawApps[i];
+            if (app && app.id && !seenIds.has(app.id)) {
+                seenIds.add(app.id);
+                dedupedList.push(app);
+            }
+        }
+        root.list = dedupedList;
+
+        root.preppedNames = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.name} `),
+            id: Fuzzy.prepare(`${a.id} `),
+            extra: Fuzzy.prepare(`${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")} `),
+            merged: `${a.name} ${a.id} ${a.genericName ?? ""} ${a.comment ?? ""} ${(a.keywords ?? []).join(" ")}`.toLowerCase(),
+            entry: a
+        }));
+
+        root.preppedIcons = dedupedList.map(a => ({
+            name: Fuzzy.prepare(`${a.icon} `),
+            entry: a
+        }));
+    }
+
 }
