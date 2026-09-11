@@ -24,18 +24,46 @@ Singleton {
 
     // https://specifications.freedesktop.org/menu/latest/category-registry.html
     property list<string> mainRegisteredCategories: ["AudioVideo", "Development", "Education", "Game", "Graphics", "Network", "Office", "Science", "Settings", "System", "Utility"]
-    property list<string> appCategories: DesktopEntries.applications.values.reduce((acc, entry) => {
+    property list<string> appCategories: []/*DesktopEntries.applications.values.reduce((acc, entry) => {
         for (const category of entry.categories) {
             if (!acc.includes(category) && mainRegisteredCategories.includes(category)) {
                 acc.push(category);
             }
         }
         return acc;
-    }, []).sort()
+    }, []).sort()*/
+
+    function updateAppCategories() {
+        const registered = mainRegisteredCategories;
+        const catSet = new Set();
+        const apps = DesktopEntries.applications.values || [];
+        for (let i = 0; i < apps.length; i++) {
+            const entry = apps[i];
+            if (!entry || !entry.categories) continue;
+            for (let j = 0; j < entry.categories.length; j++) {
+                const cat = entry.categories[j];
+                if (registered.includes(cat)) {
+                    catSet.add(cat);
+                }
+            }
+        }
+        root.appCategories = Array.from(catSet).sort();
+    }
+
+    Connections {
+        target: DesktopEntries.applications
+        function onValuesChanged() {
+            Qt.callLater(root.updateAppCategories);
+        }
+    }
+
+    Component.onCompleted: {
+        updateAppCategories();
+    }
 
     // Load user action scripts from ~/.config/illogical-impulse/actions/
     // Uses FolderListModel to auto-reload when scripts are added/removed
-    property var userActionScripts: {
+    property var userActionScripts: []/*{
         const actions = [];
         for (let i = 0; i < userActionsFolder.count; i++) {
             const fileName = userActionsFolder.get(i, "fileName");
@@ -51,6 +79,24 @@ Singleton {
             }
         }
         return actions;
+    }*/
+
+    function updateUserActionScripts() {
+        const actions = [];
+        for (let i = 0; i < userActionsFolder.count; i++) {
+            const fileName = userActionsFolder.get(i, "fileName");
+            const filePath = userActionsFolder.get(i, "filePath");
+            if (fileName && filePath) {
+                const actionName = fileName.replace(/\.[^/.]+$/, "");
+                actions.push({
+                    action: actionName,
+                    execute: ((path) => (args) => {
+                        Quickshell.execDetached([path, ...(args ? args.split(" ") : [])]);
+                    })(FileUtils.trimFileProtocol(filePath.toString()))
+                });
+            }
+        }
+        root.userActionScripts = actions;
     }
 
     FolderListModel {
@@ -164,7 +210,7 @@ Singleton {
         }
     }
 
-    property list<var> results: {
+    /*property list<var> results: []{
         // Search results are handled here
         ////////////////// Skip? //////////////////
         if (root.query == "")
@@ -354,6 +400,235 @@ Singleton {
         }
 
         return result;
+    }*/
+
+    property list<var> results: []
+    property var _activeObjects: []
+
+    onQueryChanged: {
+        nonAppResultsTimer.restart();
+        rebuildResultsTimer.restart();
+    }
+
+    Timer {
+        id: rebuildResultsTimer
+        interval: 10 // 微防抖 (10ms)
+        repeat: false
+        onTriggered: root.rebuildResults()
+    }
+
+    // 显式清理旧创建的 QML 对象，消除内存泄漏与垃圾回收卡顿
+    function clearOldObjects() {
+        for (let i = 0; i < root._activeObjects.length; i++) {
+            if (root._activeObjects[i]) {
+                root._activeObjects[i].destroy();
+            }
+        }
+        root._activeObjects = [];
+    }
+
+    function rebuildResults() {
+        clearOldObjects();
+
+        if (root.query === "") {
+            root.results = [];
+            return;
+        }
+
+        const createdObjects = [];
+        function createResultObj(properties) {
+            const obj = resultComp.createObject(null, properties);
+            if (obj) createdObjects.push(obj);
+            return obj;
+        }
+
+        // 1. 剪贴板匹配
+        if (root.query.startsWith(Config.options.search.prefix.clipboard)) {
+            const searchString = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.clipboard);
+            // 💡 截断最多 15 条，防止全量实例化 UI 崩溃
+            const rawClipResults = Cliphist.fuzzyQuery(searchString);
+            
+            const clipObjects = rawClipResults.map((entry, index, array) => {
+                const mightBlurImage = Cliphist.entryIsImage(entry) && root.clipboardWorkSafetyActive;
+                let shouldBlurImage = mightBlurImage;
+                if (mightBlurImage) {
+                    shouldBlurImage = shouldBlurImage && (root.containsUnsafeLink(array[index - 1]) || root.containsUnsafeLink(array[index + 1]));
+                }
+                const type = `#${entry.match(/^\s*(\S+)/)?.[1] || ""}`;
+                return createResultObj({
+                    rawValue: entry,
+                    name: StringUtils.cleanCliphistEntry(entry),
+                    verb: "",
+                    type: type,
+                    execute: () => { Cliphist.copy(entry); },
+                    actions: [
+                        createResultObj({
+                            name: Translation.tr("Copy"),
+                            iconName: "content_copy",
+                            iconType: LauncherSearchResult.IconType.Material,
+                            execute: () => { Cliphist.copy(entry); }
+                        }),
+                        createResultObj({
+                            name: Translation.tr("Delete"),
+                            iconName: "delete",
+                            iconType: LauncherSearchResult.IconType.Material,
+                            execute: () => { Cliphist.deleteEntry(entry); }
+                        })
+                    ],
+                    blurImage: shouldBlurImage
+                });
+            }).filter(Boolean);
+
+            root._activeObjects = createdObjects;
+            root.results = clipObjects;
+            return;
+        }
+
+        // 2. Emoji 匹配
+        if (root.query.startsWith(Config.options.search.prefix.emojis)) {
+            const searchString = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.emojis);
+            // 💡 截断最多 20 条
+            const rawEmojiResults = Emojis.fuzzyQuery(searchString).slice(0, 20);
+            
+            const emojiObjects = rawEmojiResults.map(entry => {
+                const emoji = entry.match(/^\s*(\S+)/)?.[1] || "";
+                return createResultObj({
+                    rawValue: entry,
+                    name: entry.replace(/^\s*\S+\s+/, ""),
+                    iconName: emoji,
+                    iconType: LauncherSearchResult.IconType.Text,
+                    verb: Translation.tr("Copy"),
+                    type: Translation.tr("Emoji"),
+                    execute: () => {
+                        Quickshell.clipboardText = entry.match(/^\s*(\S+)/)?.[1];
+                    }
+                });
+            }).filter(Boolean);
+
+            root._activeObjects = createdObjects;
+            root.results = emojiObjects;
+            return;
+        }
+
+        // 3. 通用搜索流程（数学、应用、Shell命令、网页搜索、Launcher Action）
+        const mathResultObject = createResultObj({
+            name: root.mathResult,
+            verb: Translation.tr("Copy"),
+            type: Translation.tr("Math result"),
+            fontType: LauncherSearchResult.FontType.Monospace,
+            iconName: 'calculate',
+            iconType: LauncherSearchResult.IconType.Material,
+            execute: () => { Quickshell.clipboardText = root.mathResult; }
+        });
+
+        // 💡 对 App 搜索结果限制最多返回 15 条
+        const rawAppEntries = AppSearch.fuzzyQuery(StringUtils.cleanPrefix(root.query, Config.options.search.prefix.app)).slice(0, 15);
+        
+        const appResultObjects = rawAppEntries.map(entry => {
+            return createResultObj({
+                type: Translation.tr("App"),
+                id: entry.id,
+                name: entry.name,
+                iconName: entry.icon,
+                iconType: LauncherSearchResult.IconType.System,
+                verb: Translation.tr("Open"),
+                execute: () => {
+                    if (!entry.runInTerminal) entry.execute();
+                    else Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(entry.command.join(' '))}'`]);
+                },
+                comment: entry.comment,
+                runInTerminal: entry.runInTerminal,
+                genericName: entry.genericName,
+                keywords: entry.keywords,
+                actions: entry.actions.map(action => {
+                    return createResultObj({
+                        name: action.name,
+                        iconName: action.icon,
+                        iconType: LauncherSearchResult.IconType.System,
+                        execute: () => {
+                            if (!action.runInTerminal) action.execute();
+                            else Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(action.command.join(' '))}'`]);
+                        }
+                    });
+                })
+            });
+        });
+
+        const commandResultObject = createResultObj({
+            name: StringUtils.cleanPrefix(root.query, Config.options.search.prefix.shellCommand).replace("file://", ""),
+            verb: Translation.tr("Run"),
+            type: Translation.tr("Command"),
+            fontType: LauncherSearchResult.FontType.Monospace,
+            iconName: 'terminal',
+            iconType: LauncherSearchResult.IconType.Material,
+            execute: () => {
+                let cleanedCommand = root.query.replace("file://", "");
+                cleanedCommand = StringUtils.cleanPrefix(cleanedCommand, Config.options.search.prefix.shellCommand);
+                if (cleanedCommand.startsWith(Config.options.search.prefix.shellCommand)) {
+                    cleanedCommand = cleanedCommand.slice(Config.options.search.prefix.shellCommand.length);
+                }
+                Quickshell.execDetached(["bash", "-c", root.query.startsWith('sudo') ? `${Config.options.apps.terminal} fish -C '${cleanedCommand}'` : cleanedCommand]);
+            }
+        });
+
+        const webSearchResultObject = createResultObj({
+            name: StringUtils.cleanPrefix(root.query, Config.options.search.prefix.webSearch),
+            verb: Translation.tr("Search"),
+            type: Translation.tr("Web search"),
+            iconName: 'travel_explore',
+            iconType: LauncherSearchResult.IconType.Material,
+            execute: () => {
+                let query = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.webSearch);
+                let url = Config.options.search.engineBaseUrl + query;
+                for (let site of Config.options.search.excludedSites) {
+                    url += ` -site:${site}`;
+                }
+                Qt.openUrlExternally(url);
+            }
+        });
+
+        const launcherActionObjects = root.allActions.map(action => {
+            const actionString = `${Config.options.search.prefix.action}${action.action}`;
+            if (actionString.startsWith(root.query) || root.query.startsWith(actionString)) {
+                return createResultObj({
+                    name: root.query.startsWith(actionString) ? root.query : actionString,
+                    verb: Translation.tr("Run"),
+                    type: Translation.tr("Action"),
+                    iconName: 'settings_suggest',
+                    iconType: LauncherSearchResult.IconType.Material,
+                    execute: () => {
+                        action.execute(root.query.split(" ").slice(1).join(" "));
+                    }
+                });
+            }
+            return null;
+        }).filter(Boolean);
+
+        let finalResults = [];
+        const startsWithNumber = /^\d/.test(root.query);
+        const startsWithMathPrefix = root.query.startsWith(Config.options.search.prefix.math);
+        const startsWithShellCommandPrefix = root.query.startsWith(Config.options.search.prefix.shellCommand);
+        const startsWithWebSearchPrefix = root.query.startsWith(Config.options.search.prefix.webSearch);
+
+        if (startsWithNumber || startsWithMathPrefix) {
+            finalResults.push(mathResultObject);
+        } else if (startsWithShellCommandPrefix) {
+            finalResults.push(commandResultObject);
+        } else if (startsWithWebSearchPrefix) {
+            finalResults.push(webSearchResultObject);
+        }
+
+        finalResults = finalResults.concat(appResultObjects);
+        finalResults = finalResults.concat(launcherActionObjects);
+
+        if (Config.options.search.prefix.showDefaultActionsWithoutPrefix) {
+            if (!startsWithShellCommandPrefix) finalResults.push(commandResultObject);
+            if (!startsWithNumber && !startsWithMathPrefix) finalResults.push(mathResultObject);
+            if (!startsWithWebSearchPrefix) finalResults.push(webSearchResultObject);
+        }
+
+        root._activeObjects = createdObjects;
+        root.results = finalResults;
     }
 
     Component {
