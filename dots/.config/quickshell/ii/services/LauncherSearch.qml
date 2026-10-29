@@ -317,12 +317,9 @@ Singleton {
                 iconType: LauncherSearchResult.IconType.System,
                 verb: Translation.tr("Open"),
                 execute: () => {
-                    if (!entry.runInTerminal)
-                        entry.execute();
-                    else {
-                        // Probably needs more proper escaping, but this will do for now
-                        Quickshell.execDetached(["bash", '-c', `${Config.options.apps.terminal} -e '${StringUtils.shellSingleQuoteEscape(entry.command.join(' '))}'`]);
-                    }
+                    // 走 HyprSplash 而不是 entry.execute()：开关关掉 / 动画不可用时
+                    // 它会自己退回 entry.execute()，行为不变。
+                    HyprSplash.launch(entry);
                 },
                 comment: entry.comment,
                 runInTerminal: entry.runInTerminal,

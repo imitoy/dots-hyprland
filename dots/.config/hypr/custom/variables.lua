@@ -1,1 +1,2 @@
-
+-- Custom variables for keybind references
+-- These can be referenced in keybinds.lua via require("custom.variables")

@@ -48,13 +48,13 @@ AppButton {
         } else if (root.appEntry.toplevels.length === 1) {
             root.appEntry.toplevels[0].activate()
         } else {
-            root.desktopEntry.execute()
+            HyprSplash.launch(root.desktopEntry)
         }
     }
 
     middleClickAction: () => {
         if (root.desktopEntry) {
-            desktopEntry.execute()
+            HyprSplash.launch(root.desktopEntry)
         }
     }
 
@@ -114,7 +114,7 @@ AppButton {
                 monochromeIcon: false,
                 action: () => {
                     if (root.desktopEntry) {
-                        root.desktopEntry.execute()
+                        HyprSplash.launch(root.desktopEntry)
                     }
                 }
             },

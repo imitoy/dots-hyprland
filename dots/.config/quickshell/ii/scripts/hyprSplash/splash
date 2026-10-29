@@ -1,0 +1,1211 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+hypr-splash —— Hyprland 上的 Android 风格应用启动动画
+
+    icon  →  图标在屏幕中心亮起  →  遮罩淡出，窗口接管
+
+构成（ii 集成版）：
+    HyprSplashOverlay.qml   overlay（挂在 ii 的 ShellRoot 下，动画全在这里）
+    services/HyprSplash.qml 对外接口：launch(entry)
+    本脚本                   解析 .desktop / 图标 → 让 overlay 入场 → 启动应用
+                            → 等窗口 map → 把窗口几何交给 overlay 做交接
+
+和 ii 的关系：overlay 是 ii 的一部分，所以 IPC 打到**正在运行的 ii 实例**上
+（`qs -c ii ipc call splash ...`），不再另起一个 Quickshell 实例。
+
+**降级是硬约束**：动画只是锦上添花，任何一步失败都必须退回「直接把应用启动起来」。
+所以 preflight / overlay 拉起 / IPC / 等窗口 全部是「失败就放弃动画」，绝不 die。
+
+依赖：Hyprland 0.55+、Quickshell、python3（仅标准库）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SHELL_DIR = str(HERE)               # 本脚本所在目录（ii 里是 .../quickshell/ii/scripts/hyprSplash）
+
+# Quickshell 的实例选择器。见 _qs_selector()：
+#   QS_SELECTOR   传给 qs 的参数，如 ["-c", "ii"] 或 ["-p", "/path/to/config"]
+#   QS_STANDALONE True 表示 overlay 是独立实例（本目录自带 shell.qml），此时允许脚本把它拉起来
+QS_SELECTOR = None
+QS_STANDALONE = False
+QS_FORCED = None                    # 由 --qs / --qs-dir 指定，优先级最高
+
+FALLBACK_ICON = "application-x-executable"
+
+# splash 窗口自己的标题。Hyprland 规则靠它精确匹配这一个窗口
+# （Quickshell 窗口的 class 是通用值，用 title 才稳）。改动要同步 README 的规则片段。
+SPLASH_TITLE = "hypr-splash"
+
+# Material 3 近似调色板：按应用名散列取色，让每次启动的容器颜色稳定
+PALETTE = [
+    "#6750A4", "#00696D", "#8B5000", "#984061",
+    "#3F6839", "#3F6374", "#7D5260", "#4A5C92",
+]
+
+# ────────────────────────────── 基础调用 ──────────────────────────────
+
+
+def sh(cmd, timeout=5):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def die(msg, code=1):
+    print(f"splash: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"splash: {msg}", file=sys.stderr)
+
+
+# RE2（Hyprland 用的正则引擎）的元字符。**故意不含 '-' 和 '_'**：
+# 它们在字符类外没有特殊含义，而 Python 的 re.escape() 会把 '-' 转义成 '\-'，
+# 在 Lua 字符串里 '\-' 是非法转义序列，Hyprland 加载时会直接报
+#   invalid escape sequence near '"^(hypr\-'
+def _re2_escape(s: str) -> str:
+    return "".join("\\" + c if c in r"\.^$|?*+()[]{}" else c for c in s)
+
+
+def _lua_str(s: str) -> str:
+    """把任意字符串安全地写成 Lua 字符串字面量（处理 \\ 和 "）。"""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _qs_selector():
+    """挑一个能连上的 Quickshell 实例，结果缓存。
+
+    优先级：
+      --qs-dir/--qs 显式指定（ii 集成走这条，QML 传的是 Quickshell.shellPath("")）
+      >  HYPR_SPLASH_QS_DIR / HYPR_SPLASH_QS 环境变量
+      >  qs -c ii（dots-hyprland 的默认配置名）
+      >  qs -p 本脚本所在目录（独立模式：那一份自带 shell.qml）
+
+    ii 自己也是用 `qs -p <shellDir> ipc call region ...` 跟自己的实例说话的（见
+    ScreenSnipToggle.qml），所以 `-p <ii 目录>` 这条是既定惯例；Quickshell 按
+    「配置路径」标识实例，`-c ii` 与 `-p ~/.config/quickshell/ii` 等价。
+
+    ⚠️ 注意 QS_STANDALONE 只在**本脚本自己那套配置**（SHELL_DIR 下确实有 shell.qml）
+    时才为 True。ii 的目录里同样有 shell.qml，但那里 overlay 是 ii 的一部分，
+    绝不能由我们另起实例 —— 所以显式指定的一律按 not standalone 处理。
+    """
+    global QS_SELECTOR, QS_STANDALONE
+    if QS_SELECTOR is not None:
+        return QS_SELECTOR
+
+    candidates = [(QS_FORCED, False)] if QS_FORCED else []
+    env_dir = os.environ.get("HYPR_SPLASH_QS_DIR")
+    if env_dir:
+        candidates.append((["-p", env_dir], False))
+    env_name = os.environ.get("HYPR_SPLASH_QS")
+    if env_name:
+        candidates.append((["-c", env_name], False))
+    candidates.append((["-c", "ii"], False))
+    if os.path.isfile(os.path.join(SHELL_DIR, "shell.qml")):
+        candidates.append((["-p", SHELL_DIR], True))
+
+    for selector, standalone in candidates:
+        p = sh(["qs", *selector, "ipc", "show"], timeout=10)
+        if p.returncode == 0 and "splash" in p.stdout:
+            QS_SELECTOR, QS_STANDALONE = selector, standalone
+            return QS_SELECTOR
+
+    QS_SELECTOR, QS_STANDALONE = candidates[0]
+    return QS_SELECTOR
+
+
+def hypr_json(*args):
+    p = sh(["hyprctl", "-j", *args])
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def hypr_eval(lua):
+    return sh(["hyprctl", "eval", lua])
+
+
+def clients():
+    return hypr_json("clients") or []
+
+
+def monitors():
+    return hypr_json("monitors") or []
+
+
+def focused_monitor():
+    ms = monitors()
+    if not ms:
+        die("拿不到显示器列表，Hyprland 在跑吗？")
+    for m in ms:
+        if m.get("focused"):
+            return m
+    return ms[0]
+
+
+# ────────────────────────────── overlay 控制 ──────────────────────────────
+
+
+def qs_ipc(*args, check=True):
+    p = sh(["qs", *_qs_selector(), "ipc", "call", "splash", *[str(a) for a in args]], timeout=10)
+    if check and p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or p.stdout.strip() or "非零退出码")
+    return p
+
+
+def shell_alive():
+    p = sh(["qs", *_qs_selector(), "ipc", "show"], timeout=10)
+    return p.returncode == 0 and "splash" in p.stdout
+
+
+def ensure_shell(wait=8.0):
+    """确认 overlay 可用。
+
+    集成模式下 overlay 就是 ii 自己的一部分：ii 没跑就没有动画，
+    **绝不另起实例**（另起一个不但白费，还会和 ii 的 IPC 目标打架）。
+    独立模式（本目录自带 shell.qml）下才允许拉起。"""
+    if shell_alive():
+        return True
+    if not QS_STANDALONE:
+        return False
+    subprocess.Popen(
+        ["qs", "-p", SHELL_DIR],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        time.sleep(0.25)
+        if shell_alive():
+            return True
+    return False
+
+
+def inject_window_rule():
+    """把 splash 窗口本身变成一个"浮动、铺满、无焦点、无动画、不装饰"的窗口。
+
+    为什么必须注入：
+      · 不加 float，FloatingWindow 会被当成普通窗口平铺掉，动画全废；
+      · 不加 no_focus / no_initial_focus，它会把焦点从正在启动的应用手里抢走；
+      · 不加 no_anim，窗口自己会有一个开窗动画，和容器动画打架。
+
+    为什么不 pin：
+      pin 的语义是"显示在所有工作区"。一旦 pin，切到别的 workspace 它照样盖着，
+      等于退回了 layer-shell 的全局行为 —— 正是这次要摆脱的东西。
+
+    规则在窗口 map 时评估，所以必须在 `begin` 触发 map 之前注入。窗口每次播放都会
+    重新 map 一次，规则持久有效；`hyprctl reload` 会清掉（reload 从配置文件重建）。
+    """
+    pattern = "^(" + _re2_escape(SPLASH_TITLE) + ")$"
+    lua = (
+        'hl.window_rule({ name = "hypr-splash-win", '
+        f"match = {{ title = {_lua_str(pattern)} }}, "
+        'float = true, '
+        'size = { "monitor_w", "monitor_h" }, '
+        'move = { 0, 0 }, '
+        'no_anim = true, '
+        'no_initial_focus = true, '
+        'no_focus = true, '
+        'decorate = false, '
+        'no_shadow = true, '
+        'no_blur = true })'
+    )
+    p = hypr_eval(lua)
+    if p.returncode != 0:
+        warn(f"注入 splash 窗口规则失败：{(p.stderr or p.stdout).strip()}")
+        warn("splash 会被平铺或抢焦点。把 README 第 1 节的规则手动写进 ~/.config/hypr/custom/rules.lua。")
+
+
+WS_RULE_NAME = "hypr-splash-ws"
+_WS_HANDLES = "_G.__hypr_splash_ws"
+
+
+def active_workspace():
+    """当前聚焦的工作区，返回 (id, name)。"""
+    ws = hypr_json("activeworkspace")
+    if not ws:
+        return None
+    return ws.get("id"), ws.get("name")
+
+
+def inject_workspace_rules(cands, ws_id) -> bool:
+    """让这一族 class 的新窗口**直接开在** splash 所在的那个工作区。
+
+    为什么需要：Hyprland 默认把新窗口开在**当前聚焦**的工作区。你点了应用就切走的话，
+    窗口会开在你切到的地方，和 splash 分了家 —— 等你切回来才发现 splash 在自娱自乐。
+
+    值写成 "<id> silent"：窗口在目标工作区打开，但不把当前的视图切过去，否则你
+    正干着活会被弹走。
+
+    为什么要注一族：规则靠 class 匹配，而 class 是应用自己定的（我们改不了），
+    猜错就**静默失效**。一族候选是尽量命中；真没命中也还有 move_to_workspace() 兜底。
+
+    句柄存进 _G，交接完由 clear_workspace_rule() 关掉，免得规则长期影响该应用之后
+    打开的所有窗口。开始前先关掉上一轮留下的（`_G` 不持久时这段是空转，不影响正确性
+    —— 因为还有兜底移动，见 README 第 0 节）。
+    """
+    if not cands or ws_id is None:
+        return False
+    lines = [
+        # 上一轮遗留的规则先关掉，否则每跑一次就多积一族
+        f"if {_WS_HANDLES} then",
+        f"  for _, h in ipairs({_WS_HANDLES}) do",
+        "    if h and h.set_enabled then h:set_enabled(false) end",
+        "  end",
+        "end",
+        f"{_WS_HANDLES} = {{}}",
+    ]
+    for i, (_name, pattern) in enumerate(cands):
+        lines.append(
+            f"table.insert({_WS_HANDLES}, hl.window_rule({{ "
+            f'name = "{WS_RULE_NAME}-{i}", '
+            f"match = {{ class = {_lua_str(pattern)} }}, "
+            f'workspace = "{ws_id} silent" }}))'
+        )
+    p = hypr_eval("\n".join(lines))
+    if p.returncode != 0:
+        warn(f"注入工作区规则失败：{(p.stderr or p.stdout).strip()}")
+        warn("新窗口会开在你当前待的工作区 —— 脚本会在窗口出现后把它挪回来（会有一下闪现）。")
+        return False
+    return True
+
+
+def clear_workspace_rule():
+    """交接完成后关掉工作区规则（句柄不在就什么都不做）。"""
+    hypr_eval(
+        f"if {_WS_HANDLES} then\n"
+        f"  for _, h in ipairs({_WS_HANDLES}) do\n"
+        "    if h and h.set_enabled then h:set_enabled(false) end\n"
+        "  end\n"
+        f"  {_WS_HANDLES} = {{}}\n"
+        "end"
+    )
+
+
+def move_to_workspace(w, ws_id) -> bool:
+    """把已经开出来的窗口挪到指定工作区（silent = 不把视图跟过去）。
+
+    这是工作区规则的**兜底**：规则靠 class 匹配、猜错就完全不生效；而窗口一旦出现，
+    我们就知道它在哪了 —— 直接挪过去，保证最终结果一定对。代价是它在错误的工作区上
+    多存在几十毫秒（通常一两帧，基本看不见）；下次跑会用上实测到的 class，不再需要兜底。
+    """
+    p = sh(["hyprctl", "dispatch", "movetoworkspacesilent",
+            f"{ws_id},address:{w.get('address')}"])
+    return p.returncode == 0
+
+
+def _splash_client():
+    """在 Hyprland 的 client 列表里找我们自己的 splash 窗口。"""
+    for w in clients():
+        if (w.get("title") or "") == SPLASH_TITLE:
+            return w
+    return None
+
+
+def wait_splash(timeout=2.0):
+    """等 splash 窗口真的 map 出来，拿到它的实际几何。
+
+    为什么需要它：规则里的 move/size 会被 Hyprland 夹进 workarea（避开 bar），
+    所以窗口原点未必等于显示器原点。handoff 坐标是在这个窗口里画的，必须减掉
+    窗口自己的 at，否则整个交接动画会偏一个 bar 的高度。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        w = _splash_client()
+        if w:
+            return w
+        time.sleep(0.05)
+    return None
+
+
+def require_shell() -> bool:
+    """把 overlay 准备好（连 Hyprland → 找到 ii → 注入 splash 窗口规则）。
+
+    返回 False = 这一轮放不了动画，调用方直接启动应用即可。
+    **这里任何一步都不会 die** —— 动画失败绝不允许变成「应用也起不来」。
+    """
+    if shutil.which("hyprctl") is None:
+        warn("找不到 hyprctl，跳过启动动画。")
+        return False
+    if sh(["hyprctl", "version"]).returncode != 0:
+        warn("连不上 Hyprland，跳过启动动画。")
+        return False
+    if shutil.which("qs") is None:
+        warn("找不到 qs（Quickshell 没装？），跳过启动动画。")
+        return False
+
+    _qs_selector()
+    if not ensure_shell():
+        if QS_STANDALONE:
+            warn(f"overlay 起不来，跳过启动动画。手动跑 `qs -p {SHELL_DIR}` 看报错。")
+        else:
+            warn("ii 没在跑（或者它的 shell.qml 里没挂 HyprSplashOverlay），跳过启动动画。"
+                 "试试 qs -c ii ipc show 看有没有 splash 目标。")
+        return False
+    inject_window_rule()
+    return True
+
+
+# ────────────────────────────── .desktop 解析 ──────────────────────────────
+
+def _desktop_dirs():
+    """要找的 .desktop 目录。跟着 XDG_DATA_DIRS 走，和 Quickshell 的扫描范围对齐，
+    再补上 flatpak / snap 的导出目录（都在 XDG_DATA_DIRS 之外）。"""
+    dirs = []
+    xdg_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs.append(os.path.join(xdg_data_home, "applications"))
+    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if d.strip():
+            dirs.append(os.path.join(d.strip(), "applications"))
+    dirs += [
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+        "/var/lib/snapd/desktop/applications",
+    ]
+    seen, out = set(), []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+DESKTOP_DIRS = _desktop_dirs()
+
+
+def _localized(data: dict, key: str) -> str:
+    """按当前 locale 取 Name[zh_CN] / Name[zh] / Name。
+
+    .desktop 里 `Name` 是默认（通常是英文）值，中文名在 `Name[zh_CN]=`。
+    早先只读 `Name`，所以腾讯会议会显示成 "WemeetApp"。
+    """
+    lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES")
+            or os.environ.get("LANG") or "")
+    lang = lang.split(".")[0]                      # zh_CN.UTF-8 -> zh_CN
+    base = lang.split("_")[0]                      # zh_CN -> zh
+    for k in (f"{key}[{lang}]", f"{key}[{base}]", key):
+        if data.get(k):
+            return data[k]
+    return ""
+
+
+def parse_desktop(path: Path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    in_entry = False
+    data = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_entry = line == "[Desktop Entry]"
+            continue
+        if not in_entry or "=" not in line or line.startswith("#"):
+            continue
+        k, v = line.split("=", 1)
+        if k not in data:  # 取第一个出现的值（同名键的本地化变体是不同的键）
+            data[k] = v.strip()
+    if data.get("NoDisplay", "").lower() == "true" or data.get("Hidden", "").lower() == "true":
+        return None
+    if not data.get("Exec"):
+        return None
+    return {
+        "id": path.stem,
+        "name": _localized(data, "Name") or path.stem,
+        "icon": data.get("Icon", ""),
+        "exec": data["Exec"],
+        "wmclass": data.get("StartupWMClass", ""),
+        "path": data.get("Path", ""),        # 工作目录；有些应用靠它找相对资源
+    }
+
+
+def _ids_for(path: Path, root: Path):
+    """一个 .desktop 可能被叫成哪些 id。
+
+    直属文件就是文件名（`firefox.desktop` → `firefox`）。子目录里的，Quickshell 会
+    把父目录名拼进 id（`applications/kde4/foo.desktop` → `kde4-foo`）；为稳妥起见把
+    多级、以及只取直接父目录的写法都列上（`a-b-foo` 和 `b-foo`）。
+    """
+    rel = path.relative_to(root)
+    ids = {path.stem}
+    if len(rel.parts) > 1:
+        ids.add("-".join(rel.parts[:-1]) + "-" + path.stem)
+        ids.add(rel.parts[-2] + "-" + path.stem)
+    return ids
+
+
+def find_entry(app_id: str):
+    if not app_id:
+        return None
+    wanted = app_id[:-8] if app_id.endswith(".desktop") else app_id
+    wanted_low = wanted.lower()
+    exact, partial = None, None
+    for d in DESKTOP_DIRS:
+        base = Path(os.path.expanduser(d))
+        if not base.is_dir():
+            continue
+        for f in base.rglob("*.desktop"):
+            ids = _ids_for(f, base)
+            if wanted in ids:
+                exact = parse_desktop(f)
+            elif partial is None and any(i.lower().endswith("." + wanted_low) for i in ids):
+                partial = parse_desktop(f)
+            if exact:
+                return exact
+    return partial
+
+
+def split_exec(exec_line: str):
+    line = re.sub(r"%[fFuUdDnNickvm]", "", exec_line).strip()
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return []
+
+
+def entry_from_cmd(cmd: list):
+    """没给 .desktop 名时，试着从命令本身反推一个 —— 目前只认 Flatpak。
+
+    这样 `./splash run -- flatpak run com.valvesoftware.Steam` 也能拿到 Steam 的
+    正确名字和图标，而不是把标签写成 "flatpak"。
+    """
+    if not cmd or Path(cmd[0]).name != "flatpak":
+        return None
+    for a in cmd[1:]:
+        if a.startswith("-") or "=" in a or a.startswith("@@") or a == "run":
+            continue
+        e = find_entry(a)
+        if e:
+            return e
+    return None
+
+
+def fallback_label(cmd: list) -> str:
+    """连 .desktop 都找不到时，给个像样的显示名（别把 "flatpak" 当应用名）。"""
+    if not cmd:
+        return "App"
+    base = Path(cmd[0]).name
+    if base == "flatpak":
+        for a in cmd[1:]:
+            if a.startswith("-") or "=" in a or a.startswith("@@") or a == "run":
+                continue
+            return a.rsplit(".", 1)[-1]        # com.valvesoftware.Steam → Steam
+    return base
+
+
+_SKIP_WORDS = {"flatpak", "env", "sh", "bash", "zsh", "fish", "nohup", "setsid",
+               "distrobox", "toolbox", "systemd-run", "gtk-launch", "run", "exec"}
+
+
+def guess_class(cmd: list) -> str:
+    """从命令行兜底猜窗口 class —— 主要给 Flatpak 用。
+
+    Flatpak 的 .desktop 通常没有 StartupWMClass（比如腾讯会议），但 Exec 里带着
+    `--command=wemeetapp`，那个一般就是窗口 class；没有 `--command=` 时退而取
+    app id（`com.spotify.Client` 之类，flatpak 常拿它当窗口 class）。
+
+    猜不到就返回空串：此时不会注入工作区规则，窗口匹配也退化成"取第一个新窗口"。
+    """
+    for a in cmd:
+        if a.startswith("--command=") and len(a) > len("--command="):
+            return a.split("=", 1)[1]
+    for a in cmd:
+        if a.startswith("-") or "=" in a or a.startswith("@@"):
+            continue
+        base = Path(a).name
+        if base in _SKIP_WORDS:
+            continue
+        return base
+    return ""
+
+
+# 这些词几乎不可能是窗口 class，但很容易误伤别的窗口（比如 `desktop`、`client`）
+_BAD_CLASS_WORDS = _SKIP_WORDS | {
+    "app", "application", "desktop", "client", "launcher", "main", "bin",
+    "stable", "x86_64", "portable", "unstable", "local", "extra",
+}
+
+
+def flatpak_app_id(cmd: list) -> str:
+    """从 `flatpak run [--opts] APPID [args...]` 里取出 APPID；不是 flatpak 返回 ""。"""
+    if not cmd or Path(cmd[0]).name != "flatpak":
+        return ""
+    for a in cmd[1:]:
+        if a.startswith("-") or "=" in a or a.startswith("@@") or a == "run":
+            continue
+        return a
+    return ""
+
+
+def class_candidates(entry, cmd: list, explicit=None, learned=None):
+    """这个应用**可能**用的窗口 class，返回有序去重的 [(名字, 正则), ...]。
+
+    为什么是一族而不是一个 —— **窗口 class 是应用自己设的，外部改不了**：
+    Hyprland 只有匹配 class 的规则（`initialclass` 也是匹配条件），没有任何改写 class
+    的效果，class 本身由客户端创建 surface 时提交。所以只能"猜一族、再慢慢收敛"。
+
+    实测反例：Flatpak Steam 的 class 是 `steam`，而它的 app id 是
+    `com.valvesoftware.Steam` —— 拿 app id 去猜必然落空，工作区规则就静默失效了
+    （用户自己的 custom/rules.lua 里那条 `class = "^steam"` 就是证据）。
+
+    同一种应用常见四种写法，所以这里都列上（规则之间是"或"的关系）：
+      · app id            com.tencent.wemeet      ← flatpak 原生（Wayland 应用常见）
+      · app id 末段        Steam / spotify         ← 很多 flatpak 应用用这个
+      · 末段的小写         steam                    ← 大小写不定
+      · 命令名             firefox / kitty          ← 原生应用
+    再加上 `.desktop` 的 StartupWMClass、flatpak 的 `--command=`、以及**上次实测学到的
+    真值**（最可信，放最前）。
+    """
+    cands = []
+
+    def add(name):
+        if not name or len(name) < 2 or name.lower() in _BAD_CLASS_WORDS:
+            return
+        if any(c[0] == name for c in cands):
+            return
+        cands.append((name, "^(" + _re2_escape(name) + ")$"))
+
+    add(learned)                                    # 上次实测到的真值 —— 优先
+    add(explicit)                                   # 用户 --class 手填的
+    add((entry or {}).get("wmclass"))               # .desktop 的 StartupWMClass
+    for a in cmd:                                   # flatpak 的 --command=wemeetapp
+        if a.startswith("--command=") and len(a) > len("--command="):
+            add(a.split("=", 1)[1])
+    app_id = flatpak_app_id(cmd)
+    if app_id:
+        add(app_id)
+        seg = app_id.rsplit(".", 1)[-1]
+        add(seg)
+        add(seg.lower())
+    if cmd:
+        add(Path(cmd[0]).name)                      # 原生应用常直接拿命令名当 class
+    return cands
+
+
+def _client_by_address(addr):
+    """按地址重取窗口 —— 窗口被挪走之后几何会变，快照就过时了。"""
+    for w in clients():
+        if w.get("address") == addr:
+            return w
+    return None
+
+
+# ────────────────────────────── class 学习缓存 ──────────────────────────────
+#
+# 候选一族只能提高命中率，实测才是真值。把每次实测到的 class 按应用记下来，
+# 下次它排在最前 —— 于是"第一次靠猜，之后都准"，收敛到不需要兜底。
+
+CACHE_FILE = Path(os.path.expanduser("~/.cache/hypr-splash/classes.json"))
+
+
+def cache_key(entry, cmd: list) -> str:
+    """缓存键：.desktop id → flatpak app id → 命令名。"""
+    if (entry or {}).get("id"):
+        return entry["id"]
+    app_id = flatpak_app_id(cmd)
+    if app_id:
+        return app_id
+    return Path(cmd[0]).name if cmd else ""
+
+
+def load_class_cache() -> dict:
+    try:
+        data = json.loads(CACHE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def remember_class(key: str, klass: str):
+    """记下实测到的真 class。写不进去不算错误，只是下次还得猜。"""
+    if not key or not klass:
+        return
+    data = load_class_cache()
+    if data.get(key) == klass:
+        return
+    data[key] = klass
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(json.dumps(data, indent=2, sort_keys=True,
+                                         ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# ────────────────────────────── 图标解析 ──────────────────────────────
+
+ICON_ROOTS = [
+    "~/.local/share/icons", "~/.icons", "/usr/local/share/icons",
+    "/usr/share/icons", "/var/lib/flatpak/exports/share/icons",
+]
+ICON_THEMES = ["hicolor", "Adwaita", "Papirus", "breeze", "breeze-dark", "Yaru", "elementary", "Numix"]
+ICON_SIZES = ["256x256", "128x128", "96x96", "64x64", "48x48", "32x32", "scalable", "symbolic"]
+ICON_CATS = ["apps", "applications", "mimetypes", "places", "devices", "status"]
+
+
+def resolve_icon(name: str) -> str:
+    """把图标名解析成绝对路径；失败则原样返回（交给 Quickshell.iconPath）。"""
+    if not name:
+        return ""
+    if name.startswith("/"):
+        return name if os.path.exists(name) else ""
+
+    for ext in (".png", ".svg", ".xpm"):
+        for p in (Path("/usr/share/pixmaps") / f"{name}{ext}",
+                  Path(os.path.expanduser("~/.local/share/pixmaps")) / f"{name}{ext}"):
+            if p.exists():
+                return str(p)
+
+    for root in ICON_ROOTS:
+        base = Path(os.path.expanduser(root))
+        if not base.is_dir():
+            continue
+        for theme in ICON_THEMES:
+            for size in ICON_SIZES:
+                for cat in ICON_CATS:
+                    for ext in (".png", ".svg"):
+                        p = base / theme / size / cat / f"{name}{ext}"
+                        if p.exists():
+                            return str(p)
+    return name
+
+
+def pick_color(seed: str) -> str:
+    if not seed:
+        return PALETTE[0]
+    return PALETTE[sum(ord(c) for c in seed) % len(PALETTE)]
+
+
+# ────────────────────────────── 窗口等待 ──────────────────────────────
+
+
+def _sock_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    p = Path(rt) / "hypr" / sig / ".socket2.sock"
+    return str(p) if p.exists() else None
+
+
+DEBUG = bool(os.environ.get("SPLASH_DEBUG"))
+
+
+def _dbg(msg: str):
+    if DEBUG:
+        print(f"    [debug] {msg}", file=sys.stderr)
+
+
+def _new_windows(before):
+    """启动之后新出现的窗口。"""
+    return [w for w in clients() if w.get("address") not in before]
+
+
+def describe(w) -> str:
+    return (f"class={w.get('class')!r} title={w.get('title')!r} "
+            f"at={w.get('at')} size={w.get('size')} floating={w.get('floating')}")
+
+
+def pick_new_window(before, names):
+    """在"启动后新出现的窗口"里挑一个。
+
+    names 非空时只认 class 命中其中任一个的（大小写不敏感的包含匹配，候选之间是"或"）；
+    为空则取第一个新窗口。
+    """
+    news = _new_windows(before)
+    if not names:
+        return news[0] if news else None
+    lows = [n.lower() for n in names]
+    for w in news:
+        klass = (w.get("class") or "").lower()
+        if any(n in klass for n in lows):
+            return w
+    return None
+
+
+def wait_for_window(before, names, timeout: float):
+    """等一个新窗口 map。
+
+    事件 socket 只当"有动静了"的唤醒信号，真正的匹配每次都重新扫 hyprctl clients。
+    早先的写法是拿事件里的地址去查单个窗口 —— 而事件到达时窗口往往还没进 clients
+    列表，那一条事件就被永久丢弃了（多窗口的应用特别容易踩这个）。
+
+    事件到达 ≠ 窗口已进 clients（事件更早）。所以收到事件后开一小段"急查"窗口
+    （20ms 一轮）：否则这一轮扫不到、又等不到下一个事件，就白等满一个 select 超时
+    ——窗口其实早就开好了，交接却慢了 100ms+。
+    """
+    deadline = time.time() + timeout
+    sock_path = _sock_path()
+    s = None
+    if sock_path:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            s.setblocking(False)
+            _dbg(f"事件 socket 已连接：{sock_path}")
+        except OSError as e:
+            _dbg(f"事件 socket 不可用（{e}），退回轮询")
+
+    buf = b""
+    burst_until = 0.0
+    try:
+        while time.time() < deadline:
+            left = max(0.0, deadline - time.time())
+            if s is not None:
+                wait = 0.02 if time.time() < burst_until else 0.15
+                r, _, _ = select.select([s], [], [], min(wait, left))
+                if r:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        s = None            # 断了就退化成纯轮询
+                        continue
+                    buf += chunk
+                    saw = False
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        saw = True
+                        _dbg("event: " + raw.decode(errors="replace"))
+                    if saw:
+                        burst_until = time.time() + 0.4
+            else:
+                time.sleep(min(0.05, left))
+
+            w = pick_new_window(before, names)
+            if w:
+                _dbg("命中 " + describe(w))
+                return w
+    finally:
+        if s is not None:
+            s.close()
+    return None
+
+
+def window_rect(w, fallback_mon, splash=None):
+    """窗口几何 → splash 窗口内的坐标（QML 用的那个坐标系）。
+
+    splash 窗口的原点未必等于显示器原点（规则里的 move/size 会被 Hyprland 夹进
+    workarea 以避开 bar），所以优先减窗口自己的 at；拿不到窗口才退回显示器原点。
+    """
+    mons = monitors()
+    mon = next((m for m in mons if m.get("id") == w.get("monitor")), fallback_mon)
+    if splash:
+        ox, oy = int(splash["at"][0]), int(splash["at"][1])
+    else:
+        ox, oy = mon["x"], mon["y"]
+    x = int(w["at"][0] - ox)
+    y = int(w["at"][1] - oy)
+    return mon, x, y, int(w["size"][0]), int(w["size"][1])
+
+
+# 注意：这里**不**给应用窗口注入任何动画规则。
+#
+# 早期版本会往这一族 class 上注 `no_anim = true`（让应用窗口瞬时出现，完全交给 overlay
+# 的容器动画），代价是应用自己的开窗动画被吃掉，交接那一瞬看起来是"硬切"。现在改回让
+# 窗口走合成器的 windowsIn 动画，和 overlay 的淡出自然叠在一起。
+#
+# 想要别的味道就直接写在 ~/.config/hypr/custom/rules.lua 里（对全部窗口生效，不必由
+# 启动器代劳），例如给某个 app 单独压成 popin 9%：
+#   hl.window_rule({ match = { class = "^steam$" }, animation = "popin 9%" })
+
+
+# ────────────────────────────── 子命令 ──────────────────────────────
+
+
+def _entry_cwd(entry, explicit=None) -> str:
+    """启动命令的工作目录：--cwd > .desktop 的 Path= > ~。
+
+    为什么要认 Path=：有些应用靠相对路径找自己的资源，忽略它启动行为会和从菜单启动
+    不一致。Quickshell 的 DesktopEntry.workingDirectory 也是同一个来源。
+    """
+    for cand in (explicit, (entry or {}).get("path")):
+        if cand:
+            p = os.path.expanduser(cand)
+            if os.path.isdir(p):
+                return p
+    return os.path.expanduser("~")
+
+
+def _launch_direct(cmd, cwd):
+    """不走动画，直接把应用拉起来。所有降级路径的终点。"""
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=cwd,
+        )
+    except OSError as e:
+        die(f"启动失败：{e}")
+    return 0
+
+
+def _splash_phase(a, entry, cmd, cwd, state) -> int:
+    """让 overlay 演一遍动画，并把应用启动起来。
+
+    返回值：0 = 动画完整走完；1 = 没能开始（应用还没启动，调用方应直接启动）；
+    2 = 应用起来了但没等到窗口（动画已取消）。
+
+    `state["spawned"]` 一旦为 True 就表示应用已经拉起来，调用方**绝不能**再启动一次 ——
+    所以它在 Popen 成功之后才置位，而之后无论怎么失败（没等到窗口、IPC 报错、异常）
+    都不会把它清掉。这样「降级」永远不会变成「启动两次」。
+    """
+    # ── 猜 class ───────────────────────────────────────────────────────────
+    # 窗口 class 由应用自己设定，外部改不了（Hyprland 只有匹配 class 的规则，没有改写
+    # class 的效果）。所以不赌一个，改成"一族候选"：规则按族注入，匹配命中任一个即可；
+    # 每次实测到的真值写进缓存，下次排最前 —— 于是第一次靠猜、之后都准。
+    key = cache_key(entry, cmd)
+    learned = load_class_cache().get(key, "")
+    cands = class_candidates(entry, cmd, explicit=a.app_class, learned=learned)
+    names = [n for n, _ in cands]
+    best = (a.app_class or (entry or {}).get("wmclass") or learned
+            or guess_class(cmd) or (names[0] if names else ""))
+
+    label = a.label or (entry or {}).get("name") or fallback_label(cmd)
+    icon = resolve_icon(a.icon or (entry or {}).get("icon") or best or cmd[0]) or FALLBACK_ICON
+    color = a.color or pick_color(best or label)
+
+    # ── overlay 就位 ───────────────────────────────────────────────────────
+    if not require_shell():
+        return 1
+
+    mon = focused_monitor()
+    ws = active_workspace()          # splash 会 map 在这个工作区，新窗口也要跟过来
+    try:
+        qs_ipc("begin", icon, label, color, mon["name"])
+    except RuntimeError as e:
+        warn(f"overlay IPC 失败（{e}），跳过启动动画。")
+        return 1
+
+    done = False
+    try:
+        splash = wait_splash()
+        if splash is None:
+            warn("splash 窗口没出现在 clients 列表；交接坐标退回按显示器原点算（可能偏一个 bar 的高度）。")
+        elif splash.get("floating") is False:
+            warn("splash 窗口没有被浮起来 —— 窗口规则没生效，它会被平铺掉。")
+            warn("把 README 第 1 节的规则写进 ~/.config/hypr/custom/rules.lua 最稳。")
+
+        # 目标工作区以 splash 窗口**实际**所在的为准（权威），拿不到才用 begin 前记下的
+        target_ws = ((splash or {}).get("workspace") or {}).get("id")
+        if target_ws is None and ws:
+            target_ws = ws[0]
+
+        if a.workspace_lock:
+            inject_workspace_rules(cands, target_ws)
+
+        before = {w.get("address") for w in clients()}
+        print(f"  splash: {label}")
+        print(f"          图标={icon}")
+        print(f"          显示器={mon['name']}  颜色={color}")
+        if names:
+            print(f"          候选 class: {' / '.join(names)}")
+        else:
+            print("          候选 class: （猜不出来，窗口匹配退化成「第一个新窗口」）")
+        if a.workspace_lock and target_ws is not None:
+            print(f"          新窗口锁到工作区 {target_ws}")
+        print(f"          命令={' '.join(cmd)}")
+
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=cwd,
+            )
+        except OSError as e:
+            warn(f"启动失败：{e}")
+            raise
+        state["spawned"] = True       # ← 从这一刻起，无论如何都不能再启动一次
+
+        t0 = time.time()
+        w = wait_for_window(before, names, a.timeout)
+
+        # 候选全没命中也不该让整段动画白演：期间只冒出一个窗口，那基本就是它
+        if w is None and names:
+            news = _new_windows(before)
+            if len(news) == 1:
+                w = news[0]
+                warn(f"没有窗口的 class 命中候选 {' / '.join(names)}，但期间只出现了一个新窗口，就用它了：")
+                warn("  " + describe(w))
+                warn("实测到的 class 已经记下，下次它会排在最前面。")
+
+        if not w:
+            print(f"  ! {a.timeout:.0f}s 内没有匹配到新窗口，动画已取消", file=sys.stderr)
+            news = _new_windows(before)
+            if news:
+                print("    这期间实际出现过的新窗口：", file=sys.stderr)
+                for x in news:
+                    print("      " + describe(x), file=sys.stderr)
+                if names:
+                    print(f"    （脚本在找 class≈{' / '.join(names)}，用 --class 指定上面某个试试）",
+                          file=sys.stderr)
+            else:
+                print("    一个都没有 —— 应用可能压根没起来，或者比 --timeout 还慢。", file=sys.stderr)
+                print("    先单独确认这条命令能启动它： " + " ".join(cmd), file=sys.stderr)
+                print("    或者加大等待：--timeout 60", file=sys.stderr)
+            print("    动画若还挂在屏幕上：splash stop", file=sys.stderr)
+            return 2
+
+        # 实测到的才是真值 —— 记下来，下次直接排最前
+        seen = (w.get("class") or "").strip()
+        if seen:
+            if names and not any(n.lower() in seen.lower() for n in names):
+                warn(f"实测 class={seen!r} 不在候选里 —— 已记下，下次优先用它。")
+            remember_class(key, seen)
+
+        # 兜底：规则没命中时窗口会开在你**当时**待的工作区，直接挪回 splash 那边。
+        # 规则命中时这一步整个空转（窗口本来就开对了），平时没有闪现。
+        if a.workspace_lock and target_ws is not None:
+            cur = (w.get("workspace") or {}).get("id")
+            if cur is not None and cur != target_ws:
+                if move_to_workspace(w, target_ws):
+                    warn(f"窗口开在了工作区 {cur}（规则没匹配上），已挪到 splash 所在的 {target_ws}。")
+                    w = _client_by_address(w["address"]) or w     # 挪完几何变了，重取
+                else:
+                    warn(f"窗口开在了工作区 {cur}，而且挪不过去 —— 它只能留在那边了。")
+
+        mon, x, y, ww, hh = window_rect(w, mon, splash)
+        print(f"  → 窗口就绪 {time.time() - t0:.2f}s  class={w.get('class')}  rect={x},{y} {ww}x{hh}")
+        qs_ipc("handoff", mon["name"], x, y, ww, hh)
+        done = True
+        return 0
+    finally:
+        # 动画没完整走完 → 把 overlay 收掉，别留个压暗层挂在屏幕上。
+        if not done:
+            qs_ipc("cancel", check=False)
+        # 窗口已经落位（或这一轮作废），工作区规则的使命结束，别留着影响它以后开的窗口。
+        clear_workspace_rule()
+
+
+def cmd_run(a):
+    entry = None
+    if a.exec_json:
+        # ii 集成的主路径：QML 直接把 DesktopEntry.command 传过来。这样启动的命令和
+        # ii 自己 execute() 会跑的**一字不差**（Quickshell 的 execute() 就是
+        # execDetached({command, workingDirectory})），我们只负责外面那层动画。
+        try:
+            cmd = json.loads(a.exec_json)
+        except json.JSONDecodeError as e:
+            die(f"--exec-json 不是合法 JSON：{e}")
+        if not isinstance(cmd, list) or not cmd:
+            die("--exec-json 需要是一个非空数组。")
+        cmd = [str(c) for c in cmd]
+        entry = find_entry(a.entry_id) if a.entry_id else None
+    elif a.command:
+        cmd = a.command
+        entry = entry_from_cmd(cmd)      # flatpak run com.foo.Bar → 反推 .desktop
+    else:
+        # a.app 为空时绝不能走到 shlex.split —— shlex.split(None) 是"从 stdin 读"，
+        # 会静默挂住等输入，看起来就像脚本卡死。
+        if not a.app:
+            die("用法：splash run <应用>   或   splash run -- <命令...>\n"
+                "      例：splash run firefox\n"
+                "          splash run -- flatpak run com.valvesoftware.Steam")
+        entry = find_entry(a.app)
+        cmd = split_exec(entry["exec"]) if entry else shlex.split(a.app)
+    if not cmd:
+        die(f"无法解析出可执行命令：{a.app or ' '.join(a.command)}")
+    if cmd[0].startswith("-"):
+        # 常见误用：`run firefox -- --private-window`。`--` 的语义是「后面这段就是命令」，
+        # 不是「给应用传参数」，所以整条命令变成了以选项开头 —— 早点说清楚。
+        die(f"`--` 之后应该是一条完整命令，但它以选项开头：{' '.join(cmd)}\n"
+            f"      `--` 的语义是「后面这段原样执行」，不是「给应用传参数」。\n"
+            f"      要传选项就把它们跟在应用名后面，例：splash run -- firefox --private-window")
+
+    cwd = _entry_cwd(entry, a.cwd)
+
+    if not a.splash:
+        return _launch_direct(cmd, cwd)
+
+    state = {"spawned": False}
+    try:
+        rc = _splash_phase(a, entry, cmd, cwd, state)
+    except SystemExit:
+        raise
+    except Exception as e:               # 动画再怎么样也不能拦住应用启动
+        warn(f"动画流程异常（{type(e).__name__}: {e}），改为直接启动应用。")
+        if DEBUG:
+            traceback.print_exc()
+        rc = 1
+
+    if state["spawned"]:
+        return rc                        # 应用已经起来了；rc 只表示动画完不完整
+    warn("启动动画不可用，直接启动应用。")
+    return _launch_direct(cmd, cwd)
+
+
+def cmd_demo(a):
+    if not require_shell():
+        return 1
+    mon = focused_monitor()
+    icon = resolve_icon(a.icon) or FALLBACK_ICON
+    label = a.label or "Demo App"
+    qs_ipc("begin", icon, label, a.color or pick_color(label), mon["name"])
+
+    print(f"  splash: {label}  (hold {a.hold}s)")
+    time.sleep(a.hold)
+    print("  → handoff（遮罩淡出）")
+    # 几何参数已无意义（遮罩只做淡出），传 0 即可 —— 签名保留是为了兼容旧调用。
+    qs_ipc("handoff", mon["name"], 0, 0, 0, 0)
+    time.sleep(0.6)
+    return 0
+
+
+def cmd_status(a):
+    if not shell_alive():
+        print("overlay 未运行")
+        return 1
+    p = qs_ipc("status", check=False)
+    print((p.stdout or p.stderr).strip())
+    return 0
+
+
+def cmd_stop(a):
+    qs_ipc("cancel", check=False)
+    print("已取消")
+    return 0
+
+
+# ────────────────────────────── CLI ──────────────────────────────
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="splash",
+        description="Hyprland 上的 Android 风格应用启动动画（图标居中 → 遮罩淡出 → 窗口接管）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  splash run firefox                 按 .desktop 解析图标/名称/class，启动并播放动画
+  splash run -- firefox --private-window
+                                     -- 之后整段当命令，不做 .desktop 解析
+  splash run -- flatpak run com.valvesoftware.Steam
+                                     Flatpak：从 app id 反推 .desktop 的图标/名字
+  splash run --entry-id org.mozilla.firefox \\
+      --exec-json '["firefox","--new-window"]' --label Firefox --icon firefox
+                                     ii 集成用的形式：命令由 Quickshell 给（保证和它
+                                     自己 execute() 跑的一模一样），id 只用来查 class
+  splash demo --icon firefox --hold 2
+                                     不启动应用，只演一遍动画（调参数用）
+  splash status | splash stop
+""",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_common(sp):
+        sp.add_argument("--icon", help="图标名或绝对路径")
+        sp.add_argument("--label", help="图标下方的文字")
+        sp.add_argument("--color", help="容器底色，如 '#6750A4'")
+        sp.add_argument("--debug", action="store_true",
+                        help="打印事件流与窗口匹配过程（排查用；也可用环境变量 SPLASH_DEBUG=1）")
+        # 这两个本来是全局的，但 argparse 里子命令必须自己收 —— main() 再统一写回
+        sp.add_argument("--qs", metavar="NAME", help="ii 的 Quickshell 配置名（默认自动探测：qs -c ii）")
+        sp.add_argument("--qs-dir", dest="qs_dir", metavar="DIR",
+                        help="ii 配置目录（Quickshell.shellPath(\"\")，等价于 --qs ii）")
+
+    r = sub.add_parser("run", help="启动应用并播放动画")
+    r.add_argument("app", nargs="?", help=".desktop id（firefox / code.desktop / org.gnome.Nautilus）")
+    # `--` 之后的命令不走 argparse：由 main() 自己切分后塞进 args.command
+    # （REMAINDER 会和 app 抢参数，见 main() 里的说明）
+    r.add_argument("--entry-id", dest="entry_id",
+                   help=".desktop id：只用来查名字/图标/StartupWMClass，不当命令用"
+                        "（配 --exec-json 时走这条路）")
+    r.add_argument("--exec-json", dest="exec_json", metavar="JSON",
+                   help='要启动的命令，JSON 数组，如 \'["firefox","-new-tab"]\'。'
+                        "ii 集成时由 Quickshell 传入 DesktopEntry.command，保证与它自己"
+                        " execute() 跑的完全一致")
+    r.add_argument("--cwd", help="工作目录（默认取 .desktop 的 Path=，没有则 ~）")
+    r.add_argument("--class", dest="app_class",
+                   help="窗口 class，强制指定（用于匹配 + 注入规则）。一般不用给：脚本会自己"
+                        "生成一族候选，并把每次实测到的真值记进 ~/.cache/hypr-splash/classes.json")
+    r.add_argument("--timeout", type=float, default=20.0, help="等窗口出现的最长秒数（默认 20）")
+    r.add_argument("--workspace-lock", action=argparse.BooleanOptionalAction, default=True,
+                   help="让新窗口固定开在 splash 所在的工作区，而不是你切走之后待的那个（默认开）；"
+                        "用 --no-workspace-lock 关闭")
+    r.add_argument("--splash", action=argparse.BooleanOptionalAction, default=True,
+                   help="播放启动动画（默认开）；--no-splash 直接启动应用")
+    add_common(r)
+
+    d = sub.add_parser("demo", help="只演动画，不启动应用")
+    d.add_argument("--hold", type=float, default=1.5, help="图标停留秒数（默认 1.5）")
+    add_common(d)
+
+    sub.add_parser("status", help="查看 overlay 当前阶段")
+    sub.add_parser("stop", help="取消正在播放的动画")
+    return p
+
+
+def main():
+    global DEBUG, QS_FORCED
+
+    # `--` 之后的内容原样透传，自己切，不用 argparse 的 REMAINDER ——
+    # REMAINDER 和 `app`（nargs="?"）放在一起时，`--` 后面第一个词会被 app 抢走：
+    #   ./splash run -- flatpak run com.foo.Bar
+    #   → app="flatpak", command=["run", "com.foo.Bar"]     ← flatpak 丢了
+    argv = sys.argv[1:]
+    passthrough = None
+    # 只对 `run` 做切分。其它子命令里出现裸 `--` 就交给 argparse 自己处理，
+    # 免得把 `splash status --` 这种的尾巴悄悄吃掉。
+    # （subparsers 是 required 的，所以 argv[0] 一定是子命令名。）
+    if argv and argv[0] == "run" and "--" in argv:
+        i = argv.index("--")
+        passthrough = argv[i + 1:]
+        argv = argv[:i]
+
+    args = build_parser().parse_args(argv)
+    if args.cmd == "run":
+        # 这里没有 hasattr 判断：command 不是 argparse 定义的参数（见上面注释），
+        # 所以它只可能由这一步产生，必须无条件赋值，否则 cmd_run 会 AttributeError。
+        args.command = passthrough or []
+
+    if getattr(args, "qs_dir", None):
+        QS_FORCED = ["-p", args.qs_dir]
+    elif getattr(args, "qs", None):
+        QS_FORCED = ["-c", args.qs]
+
+    if getattr(args, "debug", False) or os.environ.get("SPLASH_DEBUG"):
+        DEBUG = True
+
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "demo":
+        return cmd_demo(args)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "stop":
+        return cmd_stop(args)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        try:
+            qs_ipc("cancel", check=False)
+        except Exception:
+            pass
+        sys.exit(130)

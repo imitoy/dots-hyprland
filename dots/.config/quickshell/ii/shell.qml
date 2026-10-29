@@ -22,6 +22,9 @@ ShellRoot {
     // Stuff for every panel family
     ReloadPopup {}
 
+    // App launch animation overlay (see services/HyprSplash.qml, scripts/hyprSplash/)
+    HyprSplashOverlay {}
+
     Component.onCompleted: {
         MaterialThemeLoader.reapplyTheme()
         Hyprsunset.load()
