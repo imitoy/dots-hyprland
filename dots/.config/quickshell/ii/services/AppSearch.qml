@@ -3,7 +3,7 @@ pragma Singleton
 import qs.modules.common
 import qs.modules.common.functions
 import Quickshell
-import QtQuick 2.15
+import QtQuick
 
 /**
  * - Eases fuzzy searching for applications by name
@@ -13,6 +13,12 @@ Singleton {
     id: root
     property bool sloppySearch: Config.options?.search.sloppy ?? false
     property real scoreThreshold: 0.2
+    // Hard cap on the number of matches returned. Every match becomes a
+    // LauncherSearchResult (plus one object per desktop action) and the UI only
+    // ever shows the first handful, so an uncapped short query is pure churn.
+    // Roughly 2x SearchWidget's typingResultLimit (15), so the list still has
+    // rows to grow into while the rest of the results stream in.
+    property int maxResults: 30
     property var substitutions: ({
         "code-url-handler": "visual-studio-code",
         "Code": "visual-studio-code",
@@ -58,9 +64,14 @@ Singleton {
     Connections {
         target: DesktopEntries.applications
 
-        // Restart timer when desktop values changes
+        // Coalesce the re-index, but do not starve it: restarting the timer on
+        // every change would keep the index empty until the desktop entry scan
+        // goes quiet, which takes seconds while the thread pool trickles entries
+        // in. Starting it only when it is idle already bounds the staleness to
+        // one interval.
         function onValuesChanged(){
-            reindexTimer.restart()
+            if (!reindexTimer.running)
+                reindexTimer.start()
         }
     }
 
@@ -69,19 +80,34 @@ Singleton {
     }
 
     function fuzzyQuery(search: string): var { // Idk why list<DesktopEntry> doesn't work
+        // An empty search means "no filter" and not "no results": typing the app
+        // prefix on its own (">") is how the launcher lists every app.
+        if (search.length === 0) return root.list;
+
         if (root.sloppySearch) {
-            const results = list.map(obj => ({
-                entry: obj,
-                score: Levendist.computeScore(obj.name.toLowerCase(), search.toLowerCase())
-            })).filter(item => item.score > root.scoreThreshold)
-                .sort((a, b) => b.score - a.score)
-            return results
-                .map(item => item.entry)
+            // Scores against the name, like before: the Levenshtein ratio is
+            // normalised by the longer string, so feeding it the whole
+            // name+id+comment blob collapses every score below the threshold.
+            const q = search.toLowerCase();
+            const scored = [];
+            for (const obj of root.preppedNames) {
+                // Substring hit: skip the expensive Levenshtein call.
+                const score = obj.lowerName.includes(q) ? 1.0 : Levendist.computeScore(obj.lowerName, q);
+                if (score > root.scoreThreshold) scored.push({ entry: obj.entry, score });
+            }
+            scored.sort((a, b) => b.score - a.score);
+            return scored.slice(0, root.maxResults).map(item => item.entry);
         }
 
-        return Fuzzy.go(search, preppedNames, {
-            all: true,
-            key: "name"
+        // name + id only. fuzzysort matches subsequences, so including the
+        // comment/keywords blob makes any 4-letter query hit dozens of entries
+        // ("fire" came back with SongRec first, through the f in "for", the i in
+        // "written", ...). The id still carries the English name of localized
+        // entries ("org.gnome.Snapshot" for 相机), which is the part worth
+        // matching on.
+        return Fuzzy.go(search, root.preppedNames, {
+            limit: root.maxResults,
+            keys: ["name", "id"]
         }).map(r => {
             return r.obj.entry
         });
@@ -108,8 +134,9 @@ Singleton {
     function guessIcon(str) {
         if (!str || str.length == 0) return "image-missing";
 
-        // First check the icon cache
-        if (_iconCache[str] !== undefined) {
+        // First check the icon cache. Use hasOwnProperty so keys like
+        // "constructor" / "toString" don't resolve through Object.prototype.
+        if (Object.prototype.hasOwnProperty.call(_iconCache, str)) {
             return _iconCache[str];
         }
 
@@ -191,20 +218,29 @@ Singleton {
         root._iconCache = ({});
 
         // Optimize Deduplication Complexity
+        // Keep the first entry per id like the old `findIndex` filter did,
+        // including entries without an id: they all share the empty key, so only
+        // the first of them survives, which is exactly what the old filter did
+        // (it compared ids too). Dropping them outright hides apps, which is
+        // what the Set version introduced.
         const seenIds = new Set();
         const dedupedList = [];
         for (let i = 0; i < rawApps.length; i++) {
             const app = rawApps[i];
-            if (app && app.id && !seenIds.has(app.id)) {
-                seenIds.add(app.id);
-                dedupedList.push(app);
-            }
+            if (!app) continue;
+            const key = app.id ?? "";
+            if (seenIds.has(key)) continue;
+            seenIds.add(key);
+            dedupedList.push(app);
         }
         root.list = dedupedList;
 
-        // Only `name` is used as the fuzzy key (see fuzzyQuery), keep this cheap
+        // Pre-compute the per-entry search strings once per index rebuild instead
+        // of re-deriving them on every keystroke.
         root.preppedNames = dedupedList.map(a => ({
-            name: Fuzzy.prepare(`${a.name} `),
+            name: Fuzzy.prepare(`${a.name ?? ""} `),
+            id: Fuzzy.prepare(`${a.id ?? ""} `),
+            lowerName: `${a.name ?? ""}`.toLowerCase(),
             entry: a
         }));
 

@@ -199,19 +199,84 @@ Singleton {
 
     property list<var> results: []
     property var _activeObjects: []
+    // Points at the "Math result" row of the current generation (null if the
+    // current results don't contain one).
+    property var _mathResultObject: null
+
+    // A prefix can be configured to "" to disable it, and "x".startsWith("") is
+    // true, so anything that is suppressed *inside* a prefix has to reject an
+    // empty prefix explicitly.
+    function inPrefix(prefix) {
+        return prefix.length > 0 && root.query.startsWith(prefix);
+    }
 
     onQueryChanged: {
-        nonAppResultsTimer.restart();
+        // The math row only exists on the paths that reach the end of
+        // rebuildResults(): the clipboard and emoji views return before it is
+        // created, so starting qalc there just spawns a process and writes its
+        // output into mathResult for nothing. The `$`, `?` and `/` prefixes do
+        // show the math row (see the default-actions block below), so they keep
+        // it.
+        if (root.query.length > 0
+                && !root.inPrefix(Config.options.search.prefix.clipboard)
+                && !root.inPrefix(Config.options.search.prefix.emojis)) {
+            nonAppResultsTimer.restart();
+        }
         rebuildResultsTimer.restart();
     }
 
-    // qalc answers asynchronously, so the math row is built from an empty or
-    // previous value. Rebuild once the answer lands, otherwise it never shows up.
+    // qalc answers asynchronously, so the result row is built from an empty or
+    // stale value. Only that one row depends on it, so update it in place
+    // instead of throwing away the whole list (which used to reset the
+    // selection and destroy objects the UI may still be holding).
     onMathResultChanged: {
-        if (root.query.length === 0) return;
-        if (root.query.startsWith(Config.options.search.prefix.clipboard)) return;
-        if (root.query.startsWith(Config.options.search.prefix.emojis)) return;
-        Qt.callLater(root.rebuildResults);
+        if (root._mathResultObject !== null) {
+            root._mathResultObject.name = root.mathResult;
+        }
+    }
+
+    // Results are no longer a declaration-time binding, so every input that used
+    // to invalidate them has to be wired up by hand now. A rebuild resets the
+    // highlight (SearchWidget calls focusFirstItem() from onResultsChanged), so
+    // only the sources that actually feed the current query trigger one.
+    Connections {
+        target: Cliphist
+        function onEntriesChanged() {
+            // Clipboard rows are only listed behind the clipboard prefix.
+            if (root.inPrefix(Config.options.search.prefix.clipboard))
+                Qt.callLater(root.rebuildResults);
+        }
+    }
+    Connections {
+        target: Emojis
+        function onListChanged() {
+            // The emoji catalog is loaded once, long after startup.
+            if (root.inPrefix(Config.options.search.prefix.emojis))
+                Qt.callLater(root.rebuildResults);
+        }
+    }
+    Connections {
+        target: AppSearch
+        function onListChanged() {
+            // App rows appear in almost every query, including the bare `>`.
+            Qt.callLater(root.rebuildResults);
+        }
+    }
+    onClipboardWorkSafetyActiveChanged: {
+        if (root.inPrefix(Config.options.search.prefix.clipboard))
+            Qt.callLater(root.rebuildResults);
+    }
+    // Row labels ("Open", "Run", ...) are baked in at build time, and the
+    // translation catalog is loaded asynchronously after startup, so a language
+    // change has to rebuild the rows too.
+    Connections {
+        target: Translation
+        function onLanguageCodeChanged() {
+            Qt.callLater(root.rebuildResults);
+        }
+        function onTranslationsChanged() {
+            Qt.callLater(root.rebuildResults);
+        }
     }
 
     Timer {
@@ -223,8 +288,7 @@ Singleton {
 
     // Swap in the new results first, only then destroy the old objects, so the
     // UI can never end up holding on to something that has already been deleted.
-    function applyResults(newResults, createdObjects, oldObjects) {
-        root._activeObjects = createdObjects;
+    function applyResults(newResults, oldObjects) {
         root.results = newResults;
         for (let i = 0; i < oldObjects.length; i++) {
             if (oldObjects[i]) {
@@ -234,11 +298,15 @@ Singleton {
     }
 
     function rebuildResults() {
-        // Objects stay tracked until applyResults() replaces them, so a failure
-        // half way through leaves nothing dangling and nothing leaked.
         const oldObjects = root._activeObjects;
 
         const createdObjects = [];
+        // Register the new generation before building it, so a throw half way
+        // through leaves it tracked and it is still destroyed on the next
+        // rebuild instead of waiting for the JS engine to collect it.
+        root._activeObjects = createdObjects;
+        root._mathResultObject = null;
+
         function createResultObj(properties) {
             const obj = resultComp.createObject(null, properties);
             if (obj) createdObjects.push(obj);
@@ -247,7 +315,7 @@ Singleton {
 
         ///////////// Special cases ///////////////
         if (root.query === "") {
-            applyResults([], createdObjects, oldObjects);
+            applyResults([], oldObjects);
             return;
         }
 
@@ -290,7 +358,7 @@ Singleton {
                 });
             }).filter(Boolean);
 
-            applyResults(clipObjects, createdObjects, oldObjects);
+            applyResults(clipObjects, oldObjects);
             return;
         } else if (root.query.startsWith(Config.options.search.prefix.emojis)) {
             const searchString = StringUtils.cleanPrefix(root.query, Config.options.search.prefix.emojis);
@@ -311,7 +379,7 @@ Singleton {
                 });
             }).filter(Boolean);
 
-            applyResults(emojiObjects, createdObjects, oldObjects);
+            applyResults(emojiObjects, oldObjects);
             return;
         }
 
@@ -327,6 +395,7 @@ Singleton {
                 Quickshell.clipboardText = root.mathResult;
             }
         });
+        root._mathResultObject = mathResultObject;
 
         const rawAppEntries = AppSearch.fuzzyQuery(StringUtils.cleanPrefix(root.query, Config.options.search.prefix.app));
         
@@ -448,7 +517,7 @@ Singleton {
                 finalResults.push(webSearchResultObject);
         }
 
-        applyResults(finalResults, createdObjects, oldObjects);
+        applyResults(finalResults, oldObjects);
     }
 
     Component {
