@@ -33,3 +33,6 @@ if status is-interactive
 end
 
 source /opt/miniconda3/etc/fish/conf.d/conda.fish
+
+fish_add_path $HOME/.local/bin
+fish_add_path /home/imitoy/.local/share/npm/bin

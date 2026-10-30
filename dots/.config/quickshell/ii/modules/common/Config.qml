@@ -596,6 +596,12 @@ Singleton {
                 property int arbitraryRaceConditionDelay: 20 // milliseconds
             }
 
+            property JsonObject hyprSplash: JsonObject { // App launch animation. See services/HyprSplash.qml
+                property bool enable: true                   // Play the splash animation when launching an app
+                property int timeout: 20                     // Seconds to wait for the app window before giving up
+                property bool workspaceLock: true            // Force the new window onto the splash's workspace
+            }
+
             property JsonObject workSafety: JsonObject {
                 property JsonObject enable: JsonObject {
                     property bool wallpaper: false
