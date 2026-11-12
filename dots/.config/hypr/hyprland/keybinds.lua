@@ -11,16 +11,10 @@ local hyprScripts = home_dir.."/.config/hypr/hyprland/scripts"
 local qsIpcCall = "qs -c $qsConfig ipc call"
 local qsIsAlive = qsIpcCall .. " TEST_ALIVE"
 
--- Hyprland 0.57: a lone-Super release bind is auto-dropped when another key is
--- pressed while Super is held, but mouse buttons / wheel don't cancel release
--- binds, so those are tracked manually via superTapCancelled.
-local superTapCancelled = false
-for _, key in ipairs({ "SUPER_L", "SUPER_R" }) do
-    hl.bind(key, function() superTapCancelled = false end, { ignore_mods = true, transparent = true })
-end
-for _, button in ipairs({ "mouse:272", "mouse:273", "mouse:274", "mouse:275", "mouse:276", "mouse_up", "mouse_down" }) do
-    hl.bind("SUPER + " .. button, function() superTapCancelled = true end, { non_consuming = true, transparent = true })
-end
+local searchToggle = hl.dsp.exec_cmd(qsIpcCall .. " search toggle || pkill fuzzel || fuzzel")
+hl.bind("SUPER + SUPER_L", searchToggle,
+    { release = true, description = "Shell: Toggle search" })
+hl.bind("SUPER + SUPER_R", searchToggle, { release = true })
 
 local function onSuperTap()
     if superTapCancelled then return end
